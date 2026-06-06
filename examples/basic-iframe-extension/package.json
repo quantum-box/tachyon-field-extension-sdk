@@ -1,0 +1,9 @@
+{
+  "name": "basic-iframe-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@tachyon/field-extension-sdk": "file:../../packages/browser"
+  }
+}

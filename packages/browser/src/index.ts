@@ -1,4 +1,24 @@
-export type FieldExtensionSurface = 'ui' | 'kiosk' | (string & {})
+export const FIELD_EXTENSION_HOST_CONTRACT_VERSION = '1' as const
+
+export const FIELD_EXTENSION_HOST_QUERY_KEYS = {
+  tenant: 'tenant',
+  extensionAppName: 'extensionAppName',
+  surface: 'surface',
+  proxyBase: 'proxyBase',
+  contractVersion: 'contractVersion',
+} as const
+
+export const FIELD_EXTENSION_MESSAGE_SOURCE = 'tachyonfield-extension' as const
+export const FIELD_EXTENSION_HOST_MESSAGE_SOURCE = 'tachyonfield-host' as const
+
+export const FIELD_EXTENSION_MESSAGE_EVENTS = {
+  ready: 'ready',
+  resize: 'resize',
+  error: 'error',
+  reload: 'reload',
+} as const
+
+export type FieldExtensionSurface = 'ui' | 'kiosk'
 
 export type FieldExtensionContext = {
   tenant: string
@@ -6,12 +26,15 @@ export type FieldExtensionContext = {
   surface: FieldExtensionSurface
   proxyBase: string
   fieldOrigin: string
+  hostOrigin: string
+  contractVersion: typeof FIELD_EXTENSION_HOST_CONTRACT_VERSION
 }
 
 export type FieldExtensionClientOptions = {
   location?: LocationLike
   fetch?: typeof fetch
   parent?: WindowLike
+  document?: DocumentLike
 }
 
 export type FieldExtensionRequestOptions = Omit<RequestInit, 'body'> & {
@@ -46,7 +69,8 @@ export type FieldExtensionApiClient = {
 export type FieldExtensionFrameClient = {
   ready(): void
   resize(height?: number): void
-  reportError(error: unknown): void
+  reportError(error: unknown, code?: string): void
+  requestReload(): void
 }
 
 export type FieldExtensionClient = {
@@ -63,11 +87,23 @@ type WindowLike = {
   postMessage(message: unknown, targetOrigin: string): void
 }
 
+type DocumentLike = {
+  documentElement: {
+    scrollHeight: number
+  }
+}
+
 type ErrorPayload = {
   message?: string
   error?: string
+  error_description?: string
+  code?: string
+  errorCode?: string
   [key: string]: unknown
 }
+
+type FieldExtensionMessageEvent =
+  (typeof FIELD_EXTENSION_MESSAGE_EVENTS)[keyof typeof FIELD_EXTENSION_MESSAGE_EVENTS]
 
 export class FieldExtensionContextError extends Error {
   constructor(message: string) {
@@ -80,13 +116,23 @@ export class FieldExtensionApiError extends Error {
   readonly status: number
   readonly statusText: string
   readonly payload: unknown
+  readonly code?: string
+  readonly url: string
 
-  constructor(status: number, statusText: string, payload: unknown) {
-    super(errorMessage(status, statusText, payload))
+  constructor(args: {
+    status: number
+    statusText: string
+    payload: unknown
+    url: string
+    code?: string
+  }) {
+    super(errorMessage(args.status, args.statusText, args.payload))
     this.name = 'FieldExtensionApiError'
-    this.status = status
-    this.statusText = statusText
-    this.payload = payload
+    this.status = args.status
+    this.statusText = args.statusText
+    this.payload = args.payload
+    this.url = args.url
+    this.code = args.code
   }
 }
 
@@ -107,16 +153,33 @@ export function createFieldExtensionClient(
   return {
     context,
     extensionApi: createExtensionApiClient(context, fetchImpl),
-    frame: createFrameClient(context, options.parent ?? globalThis.parent),
+    frame: createFrameClient(
+      context,
+      options.parent ?? globalThis.parent,
+      options.document ?? globalThis.document,
+    ),
   }
 }
 
 export function readFieldExtensionContext(location: LocationLike): FieldExtensionContext {
   const url = new URL(location.href)
-  const tenant = requiredParam(url, 'tenant')
-  const extensionAppName = requiredParam(url, 'extensionAppName')
-  const surface = requiredParam(url, 'surface') as FieldExtensionSurface
-  const proxyBase = requiredParam(url, 'proxyBase')
+  const tenant = requiredParam(url, FIELD_EXTENSION_HOST_QUERY_KEYS.tenant)
+  const extensionAppName = requiredParam(
+    url,
+    FIELD_EXTENSION_HOST_QUERY_KEYS.extensionAppName,
+  )
+  const surface = requiredSurface(url)
+  const proxyBase = requiredParam(url, FIELD_EXTENSION_HOST_QUERY_KEYS.proxyBase)
+  const contractVersion =
+    url.searchParams.get(FIELD_EXTENSION_HOST_QUERY_KEYS.contractVersion) ??
+    FIELD_EXTENSION_HOST_CONTRACT_VERSION
+  const hostOrigin = url.searchParams.get('hostOrigin') ?? url.origin
+
+  if (contractVersion !== FIELD_EXTENSION_HOST_CONTRACT_VERSION) {
+    throw new FieldExtensionContextError(
+      `Unsupported Field extension host contract version: ${contractVersion}`,
+    )
+  }
 
   return {
     tenant,
@@ -124,7 +187,30 @@ export function readFieldExtensionContext(location: LocationLike): FieldExtensio
     surface,
     proxyBase: normalizeProxyBase(proxyBase),
     fieldOrigin: url.origin,
+    hostOrigin,
+    contractVersion,
   }
+}
+
+export function buildFieldExtensionProxyUrl(
+  context: FieldExtensionContext,
+  path: string,
+  query?: FieldExtensionRequestOptions['query'],
+) {
+  return buildProxyUrl(context, path, query)
+}
+
+export function isExpectedHostMessage(
+  context: FieldExtensionContext,
+  event: MessageEvent,
+) {
+  return (
+    event.origin === context.hostOrigin &&
+    isRecord(event.data) &&
+    event.data.source === FIELD_EXTENSION_HOST_MESSAGE_SOURCE &&
+    (event.data.contractVersion === undefined ||
+      event.data.contractVersion === context.contractVersion)
+  )
 }
 
 function createExtensionApiClient(
@@ -135,12 +221,13 @@ function createExtensionApiClient(
     path: string,
     options: FieldExtensionRequestOptions = {},
   ): Promise<T> => {
-    const response = await fetchImpl(buildProxyUrl(context, path, options.query), {
+    const url = buildProxyUrl(context, path, options.query)
+    const response = await fetchImpl(url, {
       ...options,
       headers: buildHeaders(options.headers, options.body),
       body: buildBody(options.body),
     })
-    return parseResponse<T>(response)
+    return parseResponse<T>(response, url)
   }
 
   return {
@@ -159,31 +246,35 @@ function createExtensionApiClient(
 function createFrameClient(
   context: FieldExtensionContext,
   parentWindow?: WindowLike,
+  document?: DocumentLike,
 ): FieldExtensionFrameClient {
-  const post = (event: string, detail: Record<string, unknown> = {}) => {
+  const post = (event: FieldExtensionMessageEvent, detail: Record<string, unknown> = {}) => {
     parentWindow?.postMessage(
       {
-        source: 'tachyonfield-extension',
+        source: FIELD_EXTENSION_MESSAGE_SOURCE,
         event,
+        contractVersion: context.contractVersion,
         extensionAppName: context.extensionAppName,
         tenant: context.tenant,
         surface: context.surface,
         ...detail,
       },
-      '*',
+      context.hostOrigin,
     )
   }
 
   return {
-    ready: () => post('ready'),
+    ready: () => post(FIELD_EXTENSION_MESSAGE_EVENTS.ready),
     resize: height =>
-      post('resize', {
-        height: height ?? document.documentElement.scrollHeight,
+      post(FIELD_EXTENSION_MESSAGE_EVENTS.resize, {
+        height: height ?? document?.documentElement.scrollHeight ?? 320,
       }),
-    reportError: error =>
-      post('error', {
+    reportError: (error, code) =>
+      post(FIELD_EXTENSION_MESSAGE_EVENTS.error, {
         message: error instanceof Error ? error.message : String(error),
+        ...(code ? { code } : {}),
       }),
+    requestReload: () => post(FIELD_EXTENSION_MESSAGE_EVENTS.reload),
   }
 }
 
@@ -192,24 +283,40 @@ function buildProxyUrl(
   path: string,
   query?: FieldExtensionRequestOptions['query'],
 ) {
-  const base = context.proxyBase.endsWith('/')
-    ? context.proxyBase.slice(0, -1)
-    : context.proxyBase
   const normalizedPath = path.startsWith('/') ? path : `/${path}`
-  const url = new URL(`${base}${normalizedPath}`, context.fieldOrigin)
-  url.searchParams.set('tenant', context.tenant)
+  const url = new URL(`${context.proxyBase}${normalizedPath}`, context.fieldOrigin)
+  applyQuery(url, path)
+  applyQuery(url, query)
+  url.searchParams.set(FIELD_EXTENSION_HOST_QUERY_KEYS.tenant, context.tenant)
+  return url.toString()
+}
 
+function applyQuery(
+  url: URL,
+  query?: string | URLSearchParams | Record<string, string | number | boolean | null | undefined>,
+) {
+  if (!query) {
+    return
+  }
+  if (typeof query === 'string') {
+    const questionIndex = query.indexOf('?')
+    if (questionIndex === -1) {
+      return
+    }
+    new URLSearchParams(query.slice(questionIndex + 1)).forEach((value, key) =>
+      url.searchParams.set(key, value),
+    )
+    return
+  }
   if (query instanceof URLSearchParams) {
     query.forEach((value, key) => url.searchParams.set(key, value))
-  } else if (query) {
-    for (const [key, value] of Object.entries(query)) {
-      if (value !== null && value !== undefined) {
-        url.searchParams.set(key, String(value))
-      }
+    return
+  }
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== null && value !== undefined) {
+      url.searchParams.set(key, String(value))
     }
   }
-
-  return url.toString()
 }
 
 function buildHeaders(
@@ -230,10 +337,16 @@ function buildBody(body: FieldExtensionRequestOptions['body']) {
   return isJsonBody(body) ? JSON.stringify(body) : body
 }
 
-async function parseResponse<T>(response: Response): Promise<T> {
+async function parseResponse<T>(response: Response, url: string): Promise<T> {
   const payload = await parsePayload(response)
   if (!response.ok) {
-    throw new FieldExtensionApiError(response.status, response.statusText, payload)
+    throw new FieldExtensionApiError({
+      status: response.status,
+      statusText: response.statusText,
+      payload,
+      url,
+      code: errorCode(payload),
+    })
   }
   return payload as T
 }
@@ -249,7 +362,7 @@ async function parsePayload(response: Response) {
   return response.text()
 }
 
-function requiredParam(url: URL, name: keyof FieldExtensionContext) {
+function requiredParam(url: URL, name: string) {
   const value = url.searchParams.get(name)
   if (!value) {
     throw new FieldExtensionContextError(`${name} query parameter is required`)
@@ -257,7 +370,20 @@ function requiredParam(url: URL, name: keyof FieldExtensionContext) {
   return value
 }
 
+function requiredSurface(url: URL): FieldExtensionSurface {
+  const surface = requiredParam(url, FIELD_EXTENSION_HOST_QUERY_KEYS.surface)
+  if (surface !== 'ui' && surface !== 'kiosk') {
+    throw new FieldExtensionContextError(
+      'surface query parameter must be either ui or kiosk',
+    )
+  }
+  return surface
+}
+
 function normalizeProxyBase(proxyBase: string) {
+  if (!proxyBase.startsWith('/api/extensions/')) {
+    throw new FieldExtensionContextError('proxyBase must start with /api/extensions/')
+  }
   return proxyBase.replace(/\/+$/, '')
 }
 
@@ -279,9 +405,21 @@ function errorMessage(status: number, statusText: string, payload: unknown) {
   if (typeof payload === 'string' && payload.trim()) {
     return payload
   }
-  if (payload && typeof payload === 'object') {
+  if (isRecord(payload)) {
     const errorPayload = payload as ErrorPayload
-    return errorPayload.message ?? errorPayload.error ?? fallback
+    return errorPayload.message ?? errorPayload.error_description ?? errorPayload.error ?? fallback
   }
   return fallback
+}
+
+function errorCode(payload: unknown) {
+  if (!isRecord(payload)) {
+    return undefined
+  }
+  const errorPayload = payload as ErrorPayload
+  return errorPayload.code ?? errorPayload.errorCode ?? errorPayload.error
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }

@@ -18,6 +18,12 @@ const preview = await field.extensionApi.post('/pricing/preview', {
 })
 ```
 
+The browser SDK reads `tenant`, `extensionAppName`, `surface`, `proxyBase`, and
+optional `contractVersion=1` from the iframe URL. API calls go through the Field
+host `proxyBase`; the SDK appends the `tenant` query parameter but does not add
+browser-side credentials or operator headers. The Field host/proxy owns token
+pass-through.
+
 ## Packages
 
 - `packages/browser` -> `@tachyon/field-extension-sdk`
